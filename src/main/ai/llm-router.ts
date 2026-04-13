@@ -146,6 +146,10 @@ export class LLMRouter {
             promptTokens = parsed.response.usage.input_tokens || 0
             completionTokens = parsed.response.usage.output_tokens || 0
           }
+          if (currentEvent === 'error' || currentEvent === 'response.failed') {
+            const errorMsg = parsed.message || parsed.error?.message || 'Unknown stream error'
+            throw new Error(`Responses API stream error: ${errorMsg}`)
+          }
         } catch { /* skip malformed JSON */ }
       }
     }
