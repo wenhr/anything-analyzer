@@ -1,4 +1,4 @@
-import type { LLMProviderConfig } from "@shared/types";
+import type { LLMProviderConfig, AiRequestLogData } from "@shared/types";
 import type { MCPToolInfo } from "../mcp/mcp-manager";
 
 interface LLMResponse {
@@ -60,11 +60,29 @@ function sanitizeForJson(obj: unknown): unknown {
 }
 
 /**
+ * Mask sensitive values in HTTP headers before logging.
+ * "Bearer sk-1234567890abcdef" → "Bearer sk-****cdef"
+ */
+function maskSensitiveHeaders(headers: Record<string, string>): Record<string, string> {
+  const masked = { ...headers };
+  for (const key of Object.keys(masked)) {
+    const lower = key.toLowerCase();
+    if (lower === 'authorization' || lower === 'x-api-key' || lower === 'api-key') {
+      masked[key] = masked[key].replace(/(\w{2,4})\w{4,}(\w{4})/, '$1****$2');
+    }
+  }
+  return masked;
+}
+
+/**
  * LLMRouter — Unified interface for calling different LLM providers.
  * Supports OpenAI, Anthropic, and OpenAI-compatible APIs.
  */
 export class LLMRouter {
-  constructor(private config: LLMProviderConfig) {}
+  constructor(
+    private config: LLMProviderConfig,
+    private onRequestComplete?: (log: AiRequestLogData) => void,
+  ) {}
 
   /**
    * Safely parse JSON from a fetch Response.
@@ -121,9 +139,13 @@ export class LLMRouter {
     callTool: (name: string, args: Record<string, unknown>) => Promise<string>,
     onChunk?: (chunk: string) => void,
     maxRounds = 10,
+    signal?: AbortSignal,
   ): Promise<LLMResponse> {
     if (this.config.name === "anthropic" || this.config.name === "minimax") {
       return this.agenticLoopAnthropic(messages, tools, callTool, onChunk, maxRounds);
+    }
+    if (this.config.apiType === "responses") {
+      return this.agenticLoopResponses(messages, tools, callTool, onChunk, maxRounds);
     }
     return this.agenticLoopOpenAI(messages, tools, callTool, onChunk, maxRounds);
   }
@@ -173,7 +195,7 @@ export class LLMRouter {
           Authorization: `Bearer ${this.config.apiKey}`,
         },
         body: JSON.stringify(sanitizeForJson(body)),
-      });
+      }, 1, false);
 
       const data = await this.safeParseJson<{
         choices: Array<{
@@ -288,7 +310,7 @@ export class LLMRouter {
           "anthropic-version": "2023-06-01",
         },
         body: JSON.stringify(sanitizeForJson(body)),
-      });
+      }, 1, false);
 
       const data = await this.safeParseJson<{
         content: AnthropicContentBlock[];
@@ -353,6 +375,127 @@ export class LLMRouter {
     return this.complete(messages, onChunk);
   }
 
+  // ---- Agentic Loop: OpenAI Responses API ----
+
+  private async agenticLoopResponses(
+    messages: ChatMessage[],
+    tools: MCPToolInfo[],
+    callTool: (name: string, args: Record<string, unknown>) => Promise<string>,
+    onChunk?: (chunk: string) => void,
+    maxRounds = 10,
+  ): Promise<LLMResponse> {
+    const responsesTools = tools.map((t) => ({
+      type: "function" as const,
+      name: t.name,
+      description: t.description,
+      parameters: t.inputSchema,
+    }));
+
+    const systemMsg = messages.find((m) => m.role === "system");
+    const input: Array<Record<string, unknown>> = messages
+      .filter((m) => m.role !== "system")
+      .map((m) => ({ role: m.role, content: m.content }));
+
+    let totalPromptTokens = 0;
+    let totalCompletionTokens = 0;
+
+    for (let round = 0; round < maxRounds; round++) {
+      const url = `${this.config.baseUrl.replace(/\/$/, "")}/responses`;
+      const body: Record<string, unknown> = {
+        model: this.config.model,
+        input,
+        max_output_tokens: this.config.maxTokens,
+        tools: responsesTools,
+        stream: false,
+      };
+      if (systemMsg) body.instructions = systemMsg.content;
+
+      const response = await this.fetchWithRetry(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          Authorization: `Bearer ${this.config.apiKey}`,
+        },
+        body: JSON.stringify(sanitizeForJson(body)),
+      }, 1, false);
+
+      const data = await this.safeParseJson<{
+        output: Array<{
+          type: string;
+          id?: string;
+          name?: string;
+          arguments?: string;
+          content?: Array<{ type: string; text: string }>;
+        }>;
+        output_text?: string;
+        usage?: { input_tokens: number; output_tokens: number };
+      }>(response);
+
+      totalPromptTokens += data.usage?.input_tokens || 0;
+      totalCompletionTokens += data.usage?.output_tokens || 0;
+
+      if (!Array.isArray(data.output)) {
+        throw new Error(`LLM 响应格式异常: 缺少 output 字段 — ${JSON.stringify(data).slice(0, 200)}`);
+      }
+
+      const functionCalls = data.output.filter((item) => item.type === "function_call");
+
+      if (functionCalls.length > 0) {
+        for (const item of data.output) {
+          input.push(item as Record<string, unknown>);
+        }
+
+        if (onChunk) {
+          const toolNames = functionCalls.map((fc) => fc.name).join(", ");
+          onChunk(`\n\n> 🔧 调用工具: ${toolNames}\n\n`);
+        }
+
+        for (const fc of functionCalls) {
+          let result: string;
+          try {
+            if (!fc.name) throw new Error("function_call missing name");
+            const args = JSON.parse(fc.arguments || "{}");
+            result = await callTool(fc.name, args);
+          } catch (err) {
+            result = `Error: ${err instanceof Error ? err.message : String(err)}`;
+          }
+          input.push({
+            type: "function_call_output",
+            call_id: fc.id,
+            output: result,
+          });
+        }
+        continue;
+      }
+
+      // No function calls → extract text
+      let content = "";
+      for (const item of data.output) {
+        if (item.type === "message" && Array.isArray(item.content)) {
+          content += item.content
+            .filter((c) => c.type === "output_text")
+            .map((c) => c.text)
+            .join("");
+        }
+      }
+
+      // Fallback: check output_text at top level
+      if (!content && typeof data.output_text === "string") {
+        content = data.output_text;
+      }
+
+      if (onChunk && content) onChunk(content);
+      return {
+        content,
+        promptTokens: totalPromptTokens,
+        completionTokens: totalCompletionTokens,
+      };
+    }
+
+    // Max rounds exceeded — do final call without tools
+    return this.completeResponses(messages, onChunk);
+  }
+
   private async completeOpenAI(
     messages: ChatMessage[],
     onChunk?: (chunk: string) => void,
@@ -373,7 +516,7 @@ export class LLMRouter {
         Authorization: `Bearer ${this.config.apiKey}`,
       },
       body: JSON.stringify(sanitizeForJson(body)),
-    });
+    }, 1, stream);
 
     if (stream) return this.parseOpenAIStream(response, onChunk!);
 
@@ -413,7 +556,7 @@ export class LLMRouter {
         Authorization: `Bearer ${this.config.apiKey}`,
       },
       body: JSON.stringify(sanitizeForJson(body)),
-    });
+    }, 1, stream);
 
     if (stream) return this.parseResponsesStream(response, onChunk!);
 
@@ -454,7 +597,7 @@ export class LLMRouter {
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify(sanitizeForJson(body)),
-    });
+    }, 1, stream);
 
     if (stream) return this.parseAnthropicStream(response, onChunk!);
 
@@ -614,37 +757,120 @@ export class LLMRouter {
     url: string,
     options: RequestInit,
     retries = 1,
+    isStreaming = false,
   ): Promise<Response> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT);
+    const startTime = Date.now();
+
+    // Extract headers for logging
+    const rawHeaders: Record<string, string> = {};
+    if (options.headers) {
+      const h = options.headers as Record<string, string>;
+      for (const [k, v] of Object.entries(h)) rawHeaders[k] = v;
+    }
+    const maskedHeaders = maskSensitiveHeaders(rawHeaders);
+
     try {
       const response = await fetch(url, {
         ...options,
         signal: controller.signal,
       });
-      // Clear timeout once we get the response headers — streaming can take much longer
       clearTimeout(timeout);
+
       if (response.status === 429 && retries > 0) {
         const retryAfter = parseInt(
           response.headers.get("retry-after") || "5",
           10,
         );
         await new Promise((r) => setTimeout(r, retryAfter * 1000));
-        return this.fetchWithRetry(url, options, retries - 1);
+        return this.fetchWithRetry(url, options, retries - 1, isStreaming);
       }
+
       if (!response.ok) {
         const errorBody = await response.text().catch(() => "");
         const host = (() => { try { return new URL(url).host; } catch { return url; } })();
+        const durationMs = Date.now() - startTime;
+
+        // Log failed request
+        this.onRequestComplete?.({
+          request_url: url,
+          request_method: (options.method ?? 'POST').toUpperCase(),
+          request_headers: JSON.stringify(maskedHeaders),
+          request_body: typeof options.body === 'string' ? options.body : '',
+          status_code: response.status,
+          response_headers: JSON.stringify(Object.fromEntries(response.headers.entries())),
+          response_body: errorBody.slice(0, 10000),
+          duration_ms: durationMs,
+          error: `${response.status} ${errorBody.slice(0, 200)}`,
+        });
+
         throw new Error(`LLM 请求失败 (${host}): ${response.status} ${errorBody.slice(0, 200)}`);
       }
-      return response;
+
+      // Success path
+      const durationMs = Date.now() - startTime;
+      const responseHeadersObj = Object.fromEntries(response.headers.entries());
+
+      if (isStreaming) {
+        // Streaming: cannot read body, mark as [streaming]
+        this.onRequestComplete?.({
+          request_url: url,
+          request_method: (options.method ?? 'POST').toUpperCase(),
+          request_headers: JSON.stringify(maskedHeaders),
+          request_body: typeof options.body === 'string' ? options.body : '',
+          status_code: response.status,
+          response_headers: JSON.stringify(responseHeadersObj),
+          response_body: '[streaming]',
+          duration_ms: durationMs,
+          error: null,
+        });
+        return response;
+      }
+
+      // Non-streaming: read body, log, then reconstruct Response
+      const responseText = await response.text();
+      this.onRequestComplete?.({
+        request_url: url,
+        request_method: (options.method ?? 'POST').toUpperCase(),
+        request_headers: JSON.stringify(maskedHeaders),
+        request_body: typeof options.body === 'string' ? options.body : '',
+        status_code: response.status,
+        response_headers: JSON.stringify(responseHeadersObj),
+        response_body: responseText.slice(0, 100000),
+        duration_ms: durationMs,
+        error: null,
+      });
+
+      return new Response(responseText, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+      });
+
     } catch (err) {
       clearTimeout(timeout);
-      // Re-throw our own HTTP errors directly; only diagnose network-level errors
+      const durationMs = Date.now() - startTime;
+
       if (err instanceof Error && err.message.startsWith('LLM 请求失败')) {
-        throw err;
+        throw err;  // Already logged above
       }
-      throw new Error(this.diagnoseNetworkError(err as Error, url));
+
+      // Network-level error — log it
+      const diagMsg = this.diagnoseNetworkError(err as Error, url);
+      this.onRequestComplete?.({
+        request_url: url,
+        request_method: (options.method ?? 'POST').toUpperCase(),
+        request_headers: JSON.stringify(maskedHeaders),
+        request_body: typeof options.body === 'string' ? options.body : '',
+        status_code: null,
+        response_headers: null,
+        response_body: null,
+        duration_ms: durationMs,
+        error: diagMsg,
+      });
+
+      throw new Error(diagMsg);
     }
   }
 
